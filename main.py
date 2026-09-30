@@ -18,27 +18,26 @@ from telethon.sessions import StringSession
 # НАСТРОЙКИ
 # ============================================================
 
+BASE_URL = "https://jobatsea.online"
+
 TELEGRAM_TARGET = "@fwd19472"
 
 SECTIONS = [
-    "https://jobatsea.online/jobs/Engine_Officers/",
-    "https://jobatsea.online/jobs/Engine_Ratings/",
-    "https://jobatsea.online/jobs/Deck_Officers/",
-    "https://jobatsea.online/jobs/Deck_Ratings/",
-    "https://jobatsea.online/jobs/Catering_Staff/",
-    "https://jobatsea.online/jobs/Offshore/",
+    "Engine_Officers",
+    "Engine_Ratings",
+    "Deck_Officers",
+    "Deck_Ratings",
+    "Catering_Staff",
+    "Offshore",
 ]
 
-SENT_FILE = Path("sent_jobs.json")
-DEBUG_DIR = Path("debug")
-
-SCAN_INTERVAL_SECONDS = 3600
+MAX_PAGES_PER_SECTION = 50
 PAGE_TIMEOUT_MS = 60_000
-MESSAGE_LIMIT = 3500
+JOB_DELAY_SECONDS = 2
+SECTION_DELAY_SECONDS = 3
 
-TELEGRAM_API_ID_RAW = os.getenv("TELEGRAM_API_ID", "").strip()
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
-TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "").strip()
+SENT_JOBS_FILE = Path("sent_jobs.json")
+DEBUG_DIR = Path("debug")
 
 
 # ============================================================
@@ -50,177 +49,153 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-logger = logging.getLogger("jobatsea")
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# E-MAIL
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ============================================================
 
-EMAIL_REGEX = re.compile(
-    r"(?<![\w.+-])"
-    r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+"
-    r"@"
-    r"[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+"
-    r"(?![\w.-])"
-)
+TELEGRAM_API_ID_RAW = os.getenv("TELEGRAM_API_ID", "").strip()
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "").strip()
+
+
+def validate_configuration() -> int:
+    if not TELEGRAM_API_ID_RAW:
+        raise ValueError(
+            "Не задана переменная TELEGRAM_API_ID "
+            "в Railway Variables"
+        )
+
+    if not TELEGRAM_API_HASH:
+        raise ValueError(
+            "Не задана переменная TELEGRAM_API_HASH "
+            "в Railway Variables"
+        )
+
+    if not TELEGRAM_SESSION:
+        raise ValueError(
+            "Не задана переменная TELEGRAM_SESSION "
+            "в Railway Variables"
+        )
+
+    try:
+        return int(TELEGRAM_API_ID_RAW)
+    except ValueError as error:
+        raise ValueError(
+            "TELEGRAM_API_ID должен содержать только цифры"
+        ) from error
+
+
+# ============================================================
+# БЕСПЛАТНЫЕ EMAIL-СЕРВИСЫ
+# ============================================================
 
 FREE_EMAIL_DOMAINS = {
     "gmail.com",
     "googlemail.com",
     "yahoo.com",
     "yahoo.co.uk",
-    "yahoo.ca",
-    "outlook.com",
+    "yahoo.de",
+    "yahoo.fr",
     "hotmail.com",
     "hotmail.co.uk",
     "live.com",
+    "outlook.com",
+    "outlook.co.uk",
     "msn.com",
     "icloud.com",
     "me.com",
     "mac.com",
     "aol.com",
-    "proton.me",
     "protonmail.com",
-    "pm.me",
+    "proton.me",
+    "tutanota.com",
+    "tuta.io",
+    "mail.com",
     "gmx.com",
     "gmx.de",
-    "mail.com",
-    "mail.ru",
-    "bk.ru",
-    "list.ru",
-    "inbox.ru",
-    "rambler.ru",
+    "zoho.com",
     "yandex.ru",
     "yandex.com",
     "ya.ru",
+    "mail.ru",
+    "bk.ru",
+    "inbox.ru",
+    "list.ru",
+    "rambler.ru",
     "ukr.net",
+    "i.ua",
+    "meta.ua",
     "web.de",
-    "tutanota.com",
-    "tuta.io",
+    "wp.pl",
+    "seznam.cz",
+    "qq.com",
+    "163.com",
+    "126.com",
 }
 
 
-def extract_emails(text: str) -> list[str]:
-    emails = EMAIL_REGEX.findall(text)
+EMAIL_PATTERN = re.compile(
+    r"\b[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+"
+    r"@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+\b"
+)
+
+
+def is_free_email(email: str) -> bool:
+    email = email.strip().lower()
+
+    if "@" not in email:
+        return True
+
+    domain = email.rsplit("@", 1)[1].lower()
+
+    return domain in FREE_EMAIL_DOMAINS
+
+
+def get_business_emails(text: str) -> list[str]:
+    if not text:
+        return []
+
+    found_emails = EMAIL_PATTERN.findall(text)
 
     result = []
-    seen = set()
 
-    for email in emails:
-        email = email.lower().strip(".,;:()[]<>\"'")
+    for email in found_emails:
+        email = email.strip().lower()
 
-        if email not in seen:
-            seen.add(email)
+        if is_free_email(email):
+            continue
+
+        if email not in result:
             result.append(email)
 
     return result
 
 
-def is_free_email(email: str) -> bool:
-    if "@" not in email:
-        return True
-
-    domain = email.rsplit("@", 1)[1].lower().strip().rstrip(".")
-    return domain in FREE_EMAIL_DOMAINS
-
-
-def get_business_emails(emails: list[str]) -> list[str]:
-    return [
-        email
-        for email in emails
-        if not is_free_email(email)
-    ]
-
-
 # ============================================================
-# КОНФИГУРАЦИЯ И ПАМЯТЬ
-# ============================================================
-
-def validate_configuration():
-    if not TELEGRAM_API_ID_RAW:
-        raise ValueError(
-            "Не задана переменная TELEGRAM_API_ID в Railway Variables"
-        )
-
-    if not TELEGRAM_API_HASH:
-        raise ValueError(
-            "Не задана переменная TELEGRAM_API_HASH в Railway Variables"
-        )
-
-    if not TELEGRAM_SESSION:
-        raise ValueError(
-            "Не задана переменная TELEGRAM_SESSION в Railway Variables"
-        )
-
-    try:
-        api_id = int(TELEGRAM_API_ID_RAW)
-    except ValueError as exc:
-        raise ValueError(
-            "TELEGRAM_API_ID должен содержать только цифры"
-        ) from exc
-
-    return api_id, TELEGRAM_API_HASH, TELEGRAM_SESSION
-
-
-def load_memory() -> set[str]:
-    if not SENT_FILE.exists():
-        logger.info(
-            "Файл sent_jobs.json отсутствует. "
-            "Начинаем с пустой памяти."
-        )
-        return set()
-
-    try:
-        data = json.loads(
-            SENT_FILE.read_text(encoding="utf-8")
-        )
-
-        if not isinstance(data, list):
-            logger.warning(
-                "sent_jobs.json имеет неправильный формат."
-            )
-            return set()
-
-        return set(str(item) for item in data)
-
-    except Exception:
-        logger.exception("Ошибка чтения sent_jobs.json")
-        return set()
-
-
-def save_memory(sent_jobs: set[str]) -> None:
-    temporary_file = SENT_FILE.with_suffix(".tmp")
-
-    temporary_file.write_text(
-        json.dumps(
-            sorted(sent_jobs),
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    temporary_file.replace(SENT_FILE)
-
-
-# ============================================================
-# ССЫЛКИ
+# РАБОТА СО ССЫЛКАМИ
 # ============================================================
 
 def normalize_url(url: str) -> str | None:
     if not url:
         return None
 
-    url = url.strip()
+    url = str(url).strip()
 
     if url.startswith(
-        ("javascript:", "mailto:", "tel:", "#")
+        (
+            "javascript:",
+            "mailto:",
+            "tel:",
+            "#",
+        )
     ):
         return None
 
     absolute_url = urljoin(
-        "https://jobatsea.online/",
+        f"{BASE_URL}/",
         url,
     )
 
@@ -246,10 +221,27 @@ def normalize_url(url: str) -> str | None:
 
 def is_job_link(url: str) -> bool:
     """
-    Ссылка на ваканцию имеет формат:
+    Валидная ссылка вакансии имеет вид:
 
-    https://jobatsea.online/job/622499/название-вакансии/
+    https://jobatsea.online/job/622499/title/
     """
+
+    if not url:
+        return False
+
+    url = str(url).strip()
+
+    # Ищем ссылку, если она находится внутри onclick,
+    # data-url или другого HTML-атрибута.
+    match = re.search(
+        r"(?:https?://jobatsea\.online)?"
+        r"/job/[^\s\"'<>\\)]+",
+        url,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        url = match.group(0)
 
     normalized = normalize_url(url)
 
@@ -259,15 +251,93 @@ def is_job_link(url: str) -> bool:
     parsed = urlparse(normalized)
     path = parsed.path.lower()
 
-    # Главное условие для вакансии.
+    parts = [
+        part
+        for part in path.split("/")
+        if part
+    ]
+
     return (
-        path.startswith("/job/")
-        and len(path.split("/")) >= 3
+        len(parts) >= 2
+        and parts[0] == "job"
+        and parts[1].isdigit()
+    )
+
+
+def extract_job_links_from_values(
+    values: list[str],
+) -> list[str]:
+    result = set()
+
+    for value in values:
+        if not value:
+            continue
+
+        value = str(value).strip()
+
+        matches = re.findall(
+            r"(?:https?://jobatsea\.online)?"
+            r"/job/[^\s\"'<>\\)]+",
+            value,
+            flags=re.IGNORECASE,
+        )
+
+        for match in matches:
+            match = match.rstrip(
+                ".,;:)]}"
+            )
+
+            normalized = normalize_url(match)
+
+            if normalized and is_job_link(normalized):
+                result.add(normalized)
+
+    return sorted(result)
+
+
+# ============================================================
+# СОХРАНЕНИЕ ОТПРАВЛЕННЫХ ВАКАНСИЙ
+# ============================================================
+
+def load_sent_jobs() -> set[str]:
+    if not SENT_JOBS_FILE.exists():
+        return set()
+
+    try:
+        data = json.loads(
+            SENT_JOBS_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if isinstance(data, list):
+            return set(str(item) for item in data)
+
+        if isinstance(data, dict):
+            return set(str(item) for item in data.keys())
+
+    except Exception:
+        logger.exception(
+            "Не удалось прочитать %s",
+            SENT_JOBS_FILE,
+        )
+
+    return set()
+
+
+def save_sent_jobs(sent_jobs: set[str]) -> None:
+    SENT_JOBS_FILE.write_text(
+        json.dumps(
+            sorted(sent_jobs),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
 
 # ============================================================
-# ПОЛУЧЕНИЕ ССЫЛОК РАЗДЕЛА
+# ПОЛУЧЕНИЕ ССЫЛОК НА ВАКАНСИИ
 # ============================================================
 
 async def get_job_links(
@@ -290,6 +360,8 @@ async def get_job_links(
             timeout=PAGE_TIMEOUT_MS,
         )
 
+        await page.wait_for_timeout(5_000)
+
         try:
             await page.wait_for_load_state(
                 "networkidle",
@@ -301,79 +373,118 @@ async def get_job_links(
                 page_url,
             )
 
-        await page.wait_for_timeout(1000)
+        # Прокрутка для запуска lazy loading.
+        for _ in range(5):
+            await page.mouse.wheel(0, 1_200)
+            await page.wait_for_timeout(500)
 
-        # Собираем все ссылки с href.
-        all_links = await page.eval_on_selector_all(
-            "a[href]",
+        # Получаем все значения HTML-атрибутов.
+        attribute_values = await page.evaluate(
             """
-            elements => elements.map(element => element.href)
-            """,
-        )
+            () => {
+                const values = [];
 
-        unique_job_links = sorted(
-            {
-                normalize_url(link)
-                for link in all_links
-                if is_job_link(link)
+                for (const element of document.querySelectorAll("*")) {
+                    for (const attribute of element.attributes) {
+                        values.push(attribute.value);
+                    }
+                }
+
+                return values;
             }
+            """
         )
 
-        unique_job_links = [
-            link
-            for link in unique_job_links
-            if link
-        ]
+        html = await page.content()
+
+        all_values = list(attribute_values)
+        all_values.append(html)
+
+        job_links = extract_job_links_from_values(
+            all_values
+        )
 
         logger.info(
-            "Всего ссылок на странице: %d",
-            len(all_links),
+            "URL браузера: %s",
+            page.url,
+        )
+
+        logger.info(
+            "Заголовок страницы: %s",
+            await page.title(),
         )
 
         logger.info(
             "Найдено ссылок на вакансии: %d",
-            len(unique_job_links),
+            len(job_links),
         )
 
-        if unique_job_links:
-            for link in unique_job_links:
-                logger.info("Ваканция: %s", link)
+        for job_link in job_links:
+            logger.info(
+                "Найдена вакансия: %s",
+                job_link,
+            )
 
-        if not unique_job_links:
+        if not job_links:
             logger.warning(
-                "Ссылки /job/ не найдены на странице: %s",
+                "Ссылки /job/ не найдены: %s",
                 page_url,
             )
 
-            DEBUG_DIR.mkdir(exist_ok=True)
+            DEBUG_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            section_name = (
+                section_url.rstrip("/")
+                .split("/")[-1]
+            )
 
             safe_name = re.sub(
                 r"[^a-zA-Z0-9_-]",
                 "_",
-                section_url.rstrip("/").split("/")[-1],
+                section_name,
             )
 
             debug_file = DEBUG_DIR / (
                 f"{safe_name}_page_{page_number}.html"
             )
 
-            try:
-                html = await page.content()
-                debug_file.write_text(
-                    html,
-                    encoding="utf-8",
-                )
+            debug_file.write_text(
+                html,
+                encoding="utf-8",
+            )
 
+            logger.warning(
+                "HTML сохранён в %s",
+                debug_file,
+            )
+
+            lower_html = html.lower()
+
+            protection_words = [
+                "cloudflare",
+                "checking your browser",
+                "just a moment",
+                "captcha",
+                "access denied",
+                "verify you are human",
+            ]
+
+            detected_protection = [
+                word
+                for word in protection_words
+                if word in lower_html
+            ]
+
+            if detected_protection:
                 logger.warning(
-                    "HTML страницы сохранён в %s",
-                    debug_file,
-                )
-            except Exception:
-                logger.exception(
-                    "Не удалось сохранить HTML страницы"
+                    "Возможна защита сайта: %s",
+                    ", ".join(detected_protection),
                 )
 
-        return unique_job_links
+        return job_links
 
     except PlaywrightTimeoutError:
         logger.exception(
@@ -384,28 +495,22 @@ async def get_job_links(
 
     except Exception:
         logger.exception(
-            "Ошибка при получении ссылок: %s",
+            "Ошибка получения ссылок: %s",
             page_url,
         )
         return []
 
 
 # ============================================================
-# ДАННЫЕ ВАКАНСИИ
+# ПОЛУЧЕНИЕ ДАННЫХ ВАКАНСИИ
 # ============================================================
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
-
 
 async def get_job_details(
     page,
     job_url: str,
 ) -> dict | None:
     logger.info(
-        "Открытие вакансии: %s",
+        "Обработка вакансии: %s",
         job_url,
     )
 
@@ -416,6 +521,8 @@ async def get_job_details(
             timeout=PAGE_TIMEOUT_MS,
         )
 
+        await page.wait_for_timeout(2_000)
+
         try:
             await page.wait_for_load_state(
                 "networkidle",
@@ -424,49 +531,48 @@ async def get_job_details(
         except PlaywrightTimeoutError:
             pass
 
-        await page.wait_for_timeout(700)
+        title = await page.title()
 
-        text = await page.locator("body").inner_text()
-        text = clean_text(text)
+        body_text = await page.locator(
+            "body"
+        ).inner_text(
+            timeout=15_000
+        )
 
-        if not text:
-            logger.warning(
-                "Текст вакансии пустой: %s",
-                job_url,
-            )
-            return None
+        body_text = re.sub(
+            r"\n{3,}",
+            "\n\n",
+            body_text,
+        ).strip()
 
-        all_emails = extract_emails(text)
-
-        if not all_emails:
-            logger.info(
-                "Ваканция пропущена: e-mail не найден: %s",
-                job_url,
-            )
-            return None
-
-        business_emails = get_business_emails(all_emails)
+        business_emails = get_business_emails(
+            body_text
+        )
 
         if not business_emails:
             logger.info(
-                "Ваканция пропущена: только бесплатный e-mail: %s",
+                "Вакансия пропущена: "
+                "корпоративный email не найден: %s",
                 job_url,
             )
             return None
 
-        logger.info(
-            "Найдены корпоративные e-mail: %s",
-            ", ".join(business_emails),
+        # Ставим подпись сверху.
+        message = (
+            "JobAtSea\n\n"
+            f"{body_text}"
         )
 
         return {
-            "text": text[:MESSAGE_LIMIT],
+            "url": job_url,
+            "title": title.strip(),
+            "text": message.strip(),
             "emails": business_emails,
         }
 
     except PlaywrightTimeoutError:
         logger.exception(
-            "Тайм-аут при открытии вакансии: %s",
+            "Тайм-аут при обработке вакансии: %s",
             job_url,
         )
         return None
@@ -480,155 +586,47 @@ async def get_job_details(
 
 
 # ============================================================
-# СКАНИРОВАНИЕ РАЗДЕЛА
+# TELEGRAM
 # ============================================================
 
-async def scan_section(
-    context,
-    section_url: str,
-    sent_jobs: set[str],
+async def send_job(
     client: TelegramClient,
-) -> None:
-    page_number = 1
-
-    page = await context.new_page()
-
+    job: dict,
+) -> bool:
     try:
-        while True:
-            job_links = await get_job_links(
-                page,
-                section_url,
-                page_number,
-            )
+        await client.send_message(
+            TELEGRAM_TARGET,
+            job["text"],
+            link_preview=False,
+        )
 
-            # Пустая страница означает конец пагинации.
-            if not job_links:
-                logger.info(
-                    "Ссылки на вакансии не найдены. "
-                    "Раздел завершён: %s",
-                    section_url,
-                )
-                break
+        logger.info(
+            "Вакансия отправлена в Telegram: %s",
+            job["url"],
+        )
 
-            new_sent_count = 0
+        return True
 
-            for job_url in job_links:
-                if job_url in sent_jobs:
-                    logger.info(
-                        "Ваканция уже была отправлена: %s",
-                        job_url,
-                    )
-                    continue
-
-                job_data = await get_job_details(
-                    page,
-                    job_url,
-                )
-
-                if not job_data:
-                    continue
-
-                message = (
-                    "JobAtSea\n\n"
-                    f"{job_data['text']}\n\n"
-                    f"E-mail: "
-                    f"{', '.join(job_data['emails'])}"
-                )
-
-                try:
-                    await client.send_message(
-                        TELEGRAM_TARGET,
-                        message,
-                    )
-
-                    sent_jobs.add(job_url)
-                    save_memory(sent_jobs)
-                    new_sent_count += 1
-
-                    logger.info(
-                        "Ваканция отправлена в Telegram: %s",
-                        job_url,
-                    )
-
-                    await asyncio.sleep(2)
-
-                except Exception:
-                    logger.exception(
-                        "Ошибка отправки вакансии: %s",
-                        job_url,
-                    )
-
-            logger.info(
-                "Страница %d обработана. "
-                "Новых вакансий отправлено: %d",
-                page_number,
-                new_sent_count,
-            )
-
-            page_number += 1
-            await asyncio.sleep(1)
-
-            # Защита от бесконечной пагинации.
-            if page_number > 100:
-                logger.warning(
-                    "Достигнут лимит 100 страниц: %s",
-                    section_url,
-                )
-                break
-
-    finally:
-        await page.close()
+    except Exception:
+        logger.exception(
+            "Ошибка отправки вакансии: %s",
+            job["url"],
+        )
+        return False
 
 
 # ============================================================
-# ОСНОВНОЙ ЦИКЛ
+# ОСНОВНАЯ ЛОГИКА
 # ============================================================
 
-async def scan_all_sections(
-    context,
+async def run_scraper(
     client: TelegramClient,
-    sent_jobs: set[str],
 ) -> None:
-    logger.info("Начинается новый цикл сканирования")
-
-    for section_url in SECTIONS:
-        try:
-            await scan_section(
-                context,
-                section_url,
-                sent_jobs,
-                client,
-            )
-        except Exception:
-            logger.exception(
-                "Ошибка обработки раздела: %s",
-                section_url,
-            )
+    sent_jobs = load_sent_jobs()
 
     logger.info(
-        "Сканирование завершено. "
-        "Следующий запуск через %d секунд",
-        SCAN_INTERVAL_SECONDS,
-    )
-
-
-async def main() -> None:
-    api_id, api_hash, session = validate_configuration()
-    sent_jobs = load_memory()
-
-    logger.info("Подключение к Telegram...")
-
-    client = TelegramClient(
-        StringSession(session),
-        api_id,
-        api_hash,
-    )
-
-    await client.start()
-
-    logger.info(
-        "Telegram подключён. Получатель: %s",
-        TELEGRAM_TARGET,
+        "Уже отправленных вакансий: %d",
+        len(sent_jobs),
     )
 
     async with async_playwright() as playwright:
@@ -638,6 +636,7 @@ async def main() -> None:
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
         )
 
@@ -646,37 +645,140 @@ async def main() -> None:
                 "Mozilla/5.0 (X11; Linux x86_64) "
                 "AppleWebKit/537.36 "
                 "(KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/120.0 Safari/537.36"
             ),
+            viewport={
+                "width": 1_440,
+                "height": 900,
+            },
             locale="en-US",
         )
 
+        section_page = await context.new_page()
+        job_page = await context.new_page()
+
         try:
-            while True:
-                await scan_all_sections(
-                    context,
-                    client,
-                    sent_jobs,
+            for section_name in SECTIONS:
+                section_url = (
+                    f"{BASE_URL}/jobs/{section_name}/"
+                )
+
+                logger.info(
+                    "Начало обработки раздела: %s",
+                    section_name,
+                )
+
+                empty_pages_in_row = 0
+
+                for page_number in range(
+                    1,
+                    MAX_PAGES_PER_SECTION + 1,
+                ):
+                    job_links = await get_job_links(
+                        section_page,
+                        section_url,
+                        page_number,
+                    )
+
+                    if not job_links:
+                        empty_pages_in_row += 1
+
+                        # После двух пустых страниц считаем,
+                        # что раздел закончился.
+                        if empty_pages_in_row >= 2:
+                            logger.info(
+                                "В разделе закончились страницы: %s",
+                                section_name,
+                            )
+                            break
+
+                        continue
+
+                    empty_pages_in_row = 0
+
+                    for job_url in job_links:
+                        if job_url in sent_jobs:
+                            logger.info(
+                                "Вакансия уже отправлялась: %s",
+                                job_url,
+                            )
+                            continue
+
+                        job = await get_job_details(
+                            job_page,
+                            job_url,
+                        )
+
+                        if job is None:
+                            # Помечать пропущенную вакансию
+                            # отправленной не нужно.
+                            continue
+
+                        was_sent = await send_job(
+                            client,
+                            job,
+                        )
+
+                        if was_sent:
+                            sent_jobs.add(job_url)
+                            save_sent_jobs(sent_jobs)
+
+                        await asyncio.sleep(
+                            JOB_DELAY_SECONDS
+                        )
+
+                logger.info(
+                    "Завершён раздел: %s",
+                    section_name,
                 )
 
                 await asyncio.sleep(
-                    SCAN_INTERVAL_SECONDS
+                    SECTION_DELAY_SECONDS
                 )
 
         finally:
             await context.close()
             await browser.close()
 
-    await client.disconnect()
+
+async def main() -> None:
+    api_id = validate_configuration()
+
+    logger.info(
+        "Запуск Telegram-клиента",
+    )
+
+    client = TelegramClient(
+        StringSession(TELEGRAM_SESSION),
+        api_id,
+        TELEGRAM_API_HASH,
+    )
+
+    await client.start()
+
+    logger.info(
+        "Telegram-клиент успешно запущен",
+    )
+
+    try:
+        await run_scraper(client)
+    finally:
+        await client.disconnect()
+
+        logger.info(
+            "Telegram-клиент отключён",
+        )
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Скрипт остановлен пользователем.")
+        logger.info(
+            "Работа остановлена пользователем",
+        )
     except Exception:
         logger.exception(
-            "Критическая ошибка приложения"
+            "Критическая ошибка приложения",
         )
         raise
