@@ -5,23 +5,20 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-from telethon import TelegramClient, StringSession
+from playwright.async_api import async_playwright
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "")
-TELEGRAM_TARGET = "@fwd19472"
 
-SENT_FILE = Path("sent_jobs.json")
-SCAN_INTERVAL = 3600
-PAGE_DELAY = 1
-MESSAGE_DELAY = 2
+TELEGRAM_TARGET = os.getenv("TELEGRAM_TARGET", "@Cvsendler_bot")
 
 SECTIONS = [
     "https://jobatsea.online/jobs/Engine_Officers/",
@@ -32,260 +29,226 @@ SECTIONS = [
     "https://jobatsea.online/jobs/Offshore/",
 ]
 
-EMAIL_REGEX = re.compile(
-    r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b"
-)
+SENT_FILE = Path(os.getenv("SENT_FILE", "sent_jobs.json"))
 
-# Адреса, которые не считаются контактными e-mail вакансии
-IGNORED_EMAIL_DOMAINS = {
-    "example.com",
-    "example.org",
-    "example.net",
-}
+EMAIL_REGEX = r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
 
-MAX_MESSAGE_LENGTH = 3900
+SCAN_INTERVAL_SECONDS = 3600
+REQUEST_DELAY_SECONDS = 2
 
 
 # ============================================================
 # MEMORY
 # ============================================================
 
-def load_sent_jobs() -> set[str]:
+def load_memory() -> set[str]:
+    """Загружает ссылки на уже отправленные вакансии."""
     if not SENT_FILE.exists():
         return set()
 
     try:
         data = json.loads(SENT_FILE.read_text(encoding="utf-8"))
-        return set(data)
-    except (json.JSONDecodeError, OSError):
-        return set()
+
+        if isinstance(data, list):
+            return set(data)
+
+    except (json.JSONDecodeError, OSError) as error:
+        print(f"Не удалось загрузить файл памяти: {error}")
+
+    return set()
 
 
-def save_sent_jobs(sent_jobs: set[str]) -> None:
-    SENT_FILE.write_text(
-        json.dumps(sorted(sent_jobs), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def extract_emails(text: str) -> list[str]:
-    found = EMAIL_REGEX.findall(text)
-    result = []
-
-    for email in found:
-        email = email.strip(".,;:()[]<>").lower()
-        domain = email.rsplit("@", 1)[-1]
-
-        if domain not in IGNORED_EMAIL_DOMAINS and email not in result:
-            result.append(email)
-
-    return result
-
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-
-    parts = []
-    current = ""
-
-    for paragraph in text.split("\n\n"):
-        candidate = f"{current}\n\n{paragraph}".strip()
-
-        if len(candidate) <= limit:
-            current = candidate
-        else:
-            if current:
-                parts.append(current)
-
-            while len(paragraph) > limit:
-                parts.append(paragraph[:limit])
-                paragraph = paragraph[limit:]
-
-            current = paragraph
-
-    if current:
-        parts.append(current)
-
-    return parts
+def save_memory(sent_jobs: set[str]) -> None:
+    """Сохраняет ссылки на отправленные вакансии."""
+    try:
+        SENT_FILE.write_text(
+            json.dumps(
+                sorted(sent_jobs),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as error:
+        print(f"Не удалось сохранить файл памяти: {error}")
 
 
 # ============================================================
 # PARSING
 # ============================================================
 
-async def get_job_links(page, section_url: str, page_number: int) -> list[str]:
-    separator = "&" if "?" in section_url else "?"
-    page_url = f"{section_url}{separator}p={page_number}"
+def extract_emails(text: str) -> list[str]:
+    """Извлекает уникальные e-mail-адреса из текста."""
+    emails = re.findall(EMAIL_REGEX, text)
 
-    try:
-        await page.goto(
-            page_url,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        await page.wait_for_timeout(1000)
-    except PlaywrightTimeoutError:
-        print(f"Timeout при открытии раздела: {page_url}")
-        return []
+    result = []
+    seen = set()
 
-    links = await page.locator("a[href*='/job/']").evaluate_all(
+    for email in emails:
+        email = email.strip(".,;:()[]<>").lower()
+
+        if email not in seen:
+            seen.add(email)
+            result.append(email)
+
+    return result
+
+
+async def get_job_links(page, section_url: str) -> list[str]:
+    """Получает ссылки на вакансии в разделе."""
+    links = await page.eval_on_selector_all(
+        "a[href]",
         """
-        elements => elements.map(element => element.href)
-        """
+        elements => elements
+            .map(element => element.href)
+            .filter(href => href.includes('/job/'))
+        """,
     )
 
-    unique_links = []
+    result = []
+
     for link in links:
-        absolute_link = urljoin(page_url, link).split("#")[0]
-        if absolute_link not in unique_links:
-            unique_links.append(absolute_link)
+        absolute_link = urljoin(section_url, link)
 
-    return unique_links
+        if absolute_link not in result:
+            result.append(absolute_link)
+
+    return result
 
 
-async def get_job_data(page, job_url: str) -> dict | None:
+async def get_job_details(page, job_url: str) -> dict | None:
+    """Открывает вакансию и возвращает данные, если найден e-mail."""
     try:
         await page.goto(
             job_url,
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=60_000,
         )
-        await page.wait_for_timeout(500)
-    except PlaywrightTimeoutError:
-        print(f"Timeout при открытии вакансии: {job_url}")
-        return None
 
-    try:
+        await page.wait_for_timeout(1000)
+
         text = await page.locator("body").inner_text()
+
     except Exception as error:
-        print(f"Не удалось получить текст вакансии: {error}")
+        print(f"Ошибка при открытии вакансии {job_url}: {error}")
         return None
 
-    text = clean_text(text)
+    text = text.strip()
+
+    if not text:
+        return None
+
     emails = extract_emails(text)
 
-    # Вакансии без e-mail пропускаются
+    # Отправляем только вакансии, где найден хотя бы один e-mail.
     if not emails:
         return None
 
     return {
-        "text": text,
+        "text": text[:3500],
         "emails": emails,
     }
 
 
-async def scan_section(page, section_url: str, sent_jobs: set[str]) -> list[dict]:
-    found_jobs = []
+# ============================================================
+# SCANNING
+# ============================================================
+
+async def scan_section(
+    page,
+    section_url: str,
+    sent_jobs: set[str],
+    client: TelegramClient,
+) -> None:
+    """Обходит страницы одного раздела."""
     page_number = 1
 
     while True:
-        print(f"Проверяется: {section_url}?p={page_number}")
+        page_url = f"{section_url}?p={page_number}"
 
-        job_links = await get_job_links(page, section_url, page_number)
+        print(f"Сканирование: {page_url}")
+
+        try:
+            await page.goto(
+                page_url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+
+            await page.wait_for_timeout(1000)
+
+        except Exception as error:
+            print(f"Ошибка при открытии раздела {page_url}: {error}")
+            break
+
+        job_links = await get_job_links(page, page_url)
 
         if not job_links:
+            print(f"Вакансии не найдены, раздел завершён: {section_url}")
             break
 
         new_links_found = False
 
-        for job_url in job_links:
-            if job_url in sent_jobs:
+        for job_link in job_links:
+            if job_link in sent_jobs:
                 continue
 
             new_links_found = True
-            job_data = await get_job_data(page, job_url)
+            print(f"Проверка вакансии: {job_link}")
 
-            if job_data:
-                found_jobs.append(
-                    {
-                        "url": job_url,
-                        "text": job_data["text"],
-                        "emails": job_data["emails"],
-                    }
+            job_data = await get_job_details(page, job_link)
+
+            if job_data is None:
+                continue
+
+            message = (
+                "JobAtSea\n\n"
+                f"{job_data['text']}\n\n"
+                f"E-mail: {', '.join(job_data['emails'])}"
+            )
+
+            try:
+                await client.send_message(
+                    TELEGRAM_TARGET,
+                    message,
+                    link_preview=False,
                 )
 
-            await asyncio.sleep(PAGE_DELAY)
+                sent_jobs.add(job_link)
+                save_memory(sent_jobs)
 
-        # Если на странице только уже обработанные ссылки,
-        # продолжаем проверять следующую страницу.
-        if not new_links_found and page_number > 100:
-            break
+                print(f"Вакансия отправлена: {job_link}")
+
+                await asyncio.sleep(REQUEST_DELAY_SECONDS)
+
+            except Exception as error:
+                print(f"Ошибка отправки в Telegram: {error}")
+
+        # Если на странице были только уже обработанные ссылки,
+        # можно перейти к следующей странице. Остановка произойдёт,
+        # когда страница станет пустой.
+        if not new_links_found:
+            print(f"Страница уже обработана: {page_url}")
 
         page_number += 1
-        await asyncio.sleep(PAGE_DELAY)
-
-    return found_jobs
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-async def send_job(client: TelegramClient, job: dict) -> None:
-    message = (
-        "JobAtSea\n\n"
-        f"{job['text']}\n\n"
-        f"Email: {', '.join(job['emails'])}"
-    )
-
-    # Ссылка намеренно не добавляется в сообщение
-    for part in split_message(message):
-        await client.send_message(TELEGRAM_TARGET, part)
-        await asyncio.sleep(MESSAGE_DELAY)
+        await asyncio.sleep(1)
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-async def run_once(client: TelegramClient) -> None:
-    sent_jobs = load_sent_jobs()
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            for section_url in SECTIONS:
-                jobs = await scan_section(page, section_url, sent_jobs)
-
-                for job in jobs:
-                    try:
-                        await send_job(client, job)
-
-                        # Сохраняем URL после успешной отправки
-                        sent_jobs.add(job["url"])
-                        save_sent_jobs(sent_jobs)
-
-                        print(f"Отправлено: {job['url']}")
-
-                    except Exception as error:
-                        print(f"Ошибка отправки вакансии: {error}")
-
-        finally:
-            await browser.close()
-
-
 async def main() -> None:
     if not TELEGRAM_API_ID:
-        raise RuntimeError("Не задана переменная TELEGRAM_API_ID")
+        raise ValueError("Не задана переменная TELEGRAM_API_ID")
 
     if not TELEGRAM_API_HASH:
-        raise RuntimeError("Не задана переменная TELEGRAM_API_HASH")
+        raise ValueError("Не задана переменная TELEGRAM_API_HASH")
 
     if not TELEGRAM_SESSION:
-        raise RuntimeError("Не задана переменная TELEGRAM_SESSION")
+        raise ValueError("Не задана переменная TELEGRAM_SESSION")
+
+    sent_jobs = load_memory()
 
     client = TelegramClient(
         StringSession(TELEGRAM_SESSION),
@@ -293,16 +256,37 @@ async def main() -> None:
         TELEGRAM_API_HASH,
     )
 
+    print("Подключение к Telegram...")
     await client.start()
+    print(f"Telegram подключён. Получатель: {TELEGRAM_TARGET}")
 
-    try:
-        while True:
-            print("Начало проверки JobAtSea")
-            await run_once(client)
-            print(f"Проверка завершена. Следующая через {SCAN_INTERVAL} секунд.")
-            await asyncio.sleep(SCAN_INTERVAL)
-    finally:
-        await client.disconnect()
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+        )
+
+        page = await browser.new_page()
+
+        try:
+            while True:
+                for section_url in SECTIONS:
+                    await scan_section(
+                        page=page,
+                        section_url=section_url,
+                        sent_jobs=sent_jobs,
+                        client=client,
+                    )
+
+                print(
+                    f"Сканирование завершено. "
+                    f"Следующий запуск через {SCAN_INTERVAL_SECONDS} секунд."
+                )
+
+                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+        finally:
+            await browser.close()
+            await client.disconnect()
 
 
 if __name__ == "__main__":
